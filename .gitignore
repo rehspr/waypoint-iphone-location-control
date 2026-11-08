@@ -1,0 +1,14 @@
+# Local runtime, logs, and generated state
+waypoint-pc/.venv/
+waypoint-pc/__pycache__/
+waypoint-pc/*.log
+waypoint-pc/*.route.json
+waypoint-pc/*.state.json
+
+# Local user instructions and machine-specific files
+joe.txt
+.DS_Store
+Thumbs.db
+*.local
+*.env
+*.env.*
