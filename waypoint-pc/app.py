@@ -34,6 +34,7 @@ _last_worker_error = ""
 _command_version = 0
 _geocode_lock = threading.Lock()
 _last_geocode = 0.0
+_ip_location_cache: tuple[float, dict[str, object]] | None = None
 
 
 def cli(*args: str, timeout: int = 45) -> subprocess.CompletedProcess[str]:
@@ -501,6 +502,26 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(200, {"results": normalized})
             except Exception as exc:
                 self.respond(502, {"error": f"Place search failed: {exc}"})
+            return
+        if route == "/api/ip-location":
+            global _ip_location_cache
+            cached = _ip_location_cache
+            if cached and time.monotonic() - cached[0] < 1800:
+                self.respond(200, cached[1])
+                return
+            try:
+                request = Request("https://ipapi.co/json/", headers={"User-Agent": "WaypointPC/0.5 (local desktop map)", "Accept": "application/json"})
+                with urlopen(request, timeout=8) as response:
+                    item = json.loads(response.read().decode("utf-8"))
+                lat, lon = float(item["latitude"]), float(item["longitude"])
+                if not -90 <= lat <= 90 or not -180 <= lon <= 180 or item.get("error"):
+                    raise ValueError("The IP location provider returned no usable location.")
+                result = {"lat": lat, "lon": lon,
+                          "label": ", ".join(part for part in (item.get("city"), item.get("region_code") or item.get("region"), item.get("country_code")) if part)}
+                _ip_location_cache = (time.monotonic(), result)
+                self.respond(200, result)
+            except Exception as exc:
+                self.respond(502, {"error": f"Could not estimate this network's location: {exc}"})
             return
         if route == "/api/devices":
             try:
