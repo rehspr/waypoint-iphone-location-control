@@ -35,6 +35,8 @@ _command_version = 0
 _geocode_lock = threading.Lock()
 _last_geocode = 0.0
 _ip_location_cache: tuple[float, dict[str, object]] | None = None
+_poi_cache: dict[str, tuple[float, list[dict[str, object]]]] = {}
+_last_poi_request = 0.0
 
 
 def cli(*args: str, timeout: int = 45) -> subprocess.CompletedProcess[str]:
@@ -522,6 +524,58 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(200, result)
             except Exception as exc:
                 self.respond(502, {"error": f"Could not estimate this network's location: {exc}"})
+            return
+        if route == "/api/pois":
+            global _last_poi_request
+            params = parse_qs(parsed.query)
+            try:
+                south, west, north, east = (float(params[key][0]) for key in ("south", "west", "north", "east"))
+                if not (-90 <= south < north <= 90 and -180 <= west < east <= 180) or (north - south) * (east - west) > 0.12:
+                    raise ValueError
+            except (KeyError, ValueError, IndexError):
+                self.respond(400, {"error": "Choose a closer map view to load nearby places."})
+                return
+            cache_key = ",".join(f"{value:.3f}" for value in (south, west, north, east))
+            cached = _poi_cache.get(cache_key)
+            if cached and time.monotonic() - cached[0] < 300:
+                self.respond(200, {"places": cached[1]})
+                return
+            try:
+                with _geocode_lock:
+                    delay = 2.0 - (time.monotonic() - _last_poi_request)
+                    if delay > 0:
+                        time.sleep(delay)
+                    bbox = f"{south:.5f},{west:.5f},{north:.5f},{east:.5f}"
+                    query = f"[out:json][timeout:12];(nwr[\"name\"][shop]({bbox});nwr[\"name\"][amenity~\"^(restaurant|cafe|fast_food|bank|pharmacy|cinema|fuel|hospital|school|university)$\"]({bbox});nwr[\"name\"][leisure~\"^(mall|shopping_centre)$\"]({bbox});nwr[\"name\"][landuse=retail]({bbox}););out center tags 350;"
+                    raw = None
+                    last_error: Exception | None = None
+                    for endpoint in ("https://overpass.kumi.systems/api/interpreter", "https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter"):
+                        request = Request(endpoint, data=query.encode("utf-8"), headers={"User-Agent": "WaypointPC/0.6 (local desktop map)", "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8", "Accept": "application/json"})
+                        try:
+                            with urlopen(request, timeout=10) as response:
+                                raw = json.loads(response.read().decode("utf-8"))
+                            break
+                        except Exception as exc:
+                            last_error = exc
+                    if raw is None:
+                        raise RuntimeError(f"All nearby-place data servers failed: {last_error}")
+                    _last_poi_request = time.monotonic()
+                places = []
+                for item in raw.get("elements", [])[:350]:
+                    tags = item.get("tags", {})
+                    lat = item.get("lat", (item.get("center") or {}).get("lat"))
+                    lon = item.get("lon", (item.get("center") or {}).get("lon"))
+                    if not tags.get("name") or lat is None or lon is None:
+                        continue
+                    category = next((tags.get(key) for key in ("shop", "amenity", "leisure", "landuse") if tags.get(key)), "place")
+                    places.append({"name": str(tags["name"]), "lat": float(lat), "lon": float(lon), "category": str(category)})
+                _poi_cache[cache_key] = (time.monotonic(), places)
+                if len(_poi_cache) > 80:
+                    for key in list(_poi_cache)[:40]:
+                        _poi_cache.pop(key, None)
+                self.respond(200, {"places": places})
+            except Exception as exc:
+                self.respond(502, {"error": f"Nearby place labels are unavailable: {exc}"})
             return
         if route == "/api/devices":
             try:
