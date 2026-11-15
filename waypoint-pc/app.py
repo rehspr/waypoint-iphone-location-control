@@ -455,7 +455,16 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         route = parsed.path
         if route == "/api/geocode":
-            query = parse_qs(parsed.query).get("q", [""])[0].strip()
+            params = parse_qs(parsed.query)
+            query = params.get("q", [""])[0].strip()
+            try:
+                near_lat = float(params["near_lat"][0]) if "near_lat" in params else None
+                near_lon = float(params["near_lon"][0]) if "near_lon" in params else None
+                if near_lat is not None and (not -90 <= near_lat <= 90 or not -180 <= near_lon <= 180):
+                    raise ValueError
+            except (ValueError, IndexError):
+                self.respond(400, {"error": "The nearby search center is invalid."})
+                return
             if not query or len(query) > 160:
                 self.respond(400, {"error": "Enter a place name to search."})
                 return
@@ -465,14 +474,31 @@ class Handler(BaseHTTPRequestHandler):
                     delay = 1.0 - (time.monotonic() - _last_geocode)
                     if delay > 0:
                         time.sleep(delay)
+                    search_url = "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=10&addressdetails=1&q=" + quote(query)
+                    if near_lat is not None:
+                        # Nominatim's viewbox biases results toward this area without excluding farther matches.
+                        search_url += f"&viewbox={near_lon - 0.35:.5f},{near_lat + 0.25:.5f},{near_lon + 0.35:.5f},{near_lat - 0.25:.5f}"
                     request = Request(
-                        "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&q=" + quote(query),
+                        search_url,
                         headers={"User-Agent": "WaypointPC/0.2 (local desktop location planner)"},
                     )
                     with urlopen(request, timeout=12) as response:
                         results = json.loads(response.read().decode("utf-8"))
                     _last_geocode = time.monotonic()
-                self.respond(200, {"results": [{"name": item.get("display_name", "Place"), "lat": item["lat"], "lon": item["lon"]} for item in results]})
+                normalized = []
+                for item in results:
+                    lat, lon = float(item["lat"]), float(item["lon"])
+                    distance = None
+                    if near_lat is not None:
+                        dy = (lat - near_lat) * 111_320
+                        dx = (lon - near_lon) * 111_320 * math.cos(math.radians(near_lat))
+                        distance = round(math.hypot(dx, dy))
+                    normalized.append({"name": item.get("name") or item.get("display_name", "Place"),
+                                       "detail": item.get("display_name", "Place"), "lat": lat, "lon": lon,
+                                       "distance_m": distance})
+                if near_lat is not None:
+                    normalized.sort(key=lambda item: item["distance_m"])
+                self.respond(200, {"results": normalized})
             except Exception as exc:
                 self.respond(502, {"error": f"Place search failed: {exc}"})
             return
