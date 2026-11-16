@@ -13,7 +13,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -533,7 +533,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not (-90 <= south < north <= 90 and -180 <= west < east <= 180) or (north - south) * (east - west) > 0.12:
                     raise ValueError
             except (KeyError, ValueError, IndexError):
-                self.respond(400, {"error": "Choose a closer map view to load nearby places."})
+                self.respond(400, {"error": "Zoom in a little closer to load nearby places."})
                 return
             cache_key = ",".join(f"{value:.3f}" for value in (south, west, north, east))
             cached = _poi_cache.get(cache_key)
@@ -541,41 +541,45 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(200, {"places": cached[1]})
                 return
             try:
+                center_lat, center_lon = (south + north) / 2, (west + east) / 2
+                tags = ("shop", "amenity:restaurant", "amenity:cafe", "amenity:fast_food",
+                        "amenity:pharmacy", "amenity:bank", "amenity:hospital", "amenity:cinema",
+                        "amenity:fuel", "amenity:school", "amenity:university", "leisure:shopping_centre")
                 with _geocode_lock:
-                    delay = 2.0 - (time.monotonic() - _last_poi_request)
+                    delay = 1.0 - (time.monotonic() - _last_poi_request)
                     if delay > 0:
                         time.sleep(delay)
-                    bbox = f"{south:.5f},{west:.5f},{north:.5f},{east:.5f}"
-                    query = f"[out:json][timeout:12];(nwr[\"name\"][shop]({bbox});nwr[\"name\"][amenity~\"^(restaurant|cafe|fast_food|bank|pharmacy|cinema|fuel|hospital|school|university)$\"]({bbox});nwr[\"name\"][leisure~\"^(mall|shopping_centre)$\"]({bbox});nwr[\"name\"][landuse=retail]({bbox}););out center tags 350;"
-                    raw = None
-                    last_error: Exception | None = None
-                    for endpoint in ("https://overpass.kumi.systems/api/interpreter", "https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter"):
-                        request = Request(endpoint, data=query.encode("utf-8"), headers={"User-Agent": "WaypointPC/0.6 (local desktop map)", "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8", "Accept": "application/json"})
-                        try:
-                            with urlopen(request, timeout=10) as response:
-                                raw = json.loads(response.read().decode("utf-8"))
-                            break
-                        except Exception as exc:
-                            last_error = exc
-                    if raw is None:
-                        raise RuntimeError(f"All nearby-place data servers failed: {last_error}")
+                    query = urlencode({"lon": f"{center_lon:.6f}", "lat": f"{center_lat:.6f}", "limit": "50"})
+                    query += "".join(f"&osm_tag={quote(tag, safe=':')}" for tag in tags)
+                    request = Request(f"https://photon.komoot.io/reverse?{query}", headers={"User-Agent": "WaypointPC/1.0 (local desktop map)", "Accept": "application/json"})
+                    with urlopen(request, timeout=8) as response:
+                        raw = json.loads(response.read().decode("utf-8"))
                     _last_poi_request = time.monotonic()
                 places = []
-                for item in raw.get("elements", [])[:350]:
-                    tags = item.get("tags", {})
-                    lat = item.get("lat", (item.get("center") or {}).get("lat"))
-                    lon = item.get("lon", (item.get("center") or {}).get("lon"))
-                    if not tags.get("name") or lat is None or lon is None:
+                seen = set()
+                for feature in raw.get("features", []):
+                    props = feature.get("properties", {})
+                    coordinates = (feature.get("geometry") or {}).get("coordinates") or []
+                    if len(coordinates) < 2 or not props.get("name"):
                         continue
-                    category = next((tags.get(key) for key in ("shop", "amenity", "leisure", "landuse") if tags.get(key)), "place")
-                    places.append({"name": str(tags["name"]), "lat": float(lat), "lon": float(lon), "category": str(category)})
+                    lon, lat = float(coordinates[0]), float(coordinates[1])
+                    if not (south <= lat <= north and west <= lon <= east):
+                        continue
+                    key = (str(props.get("osm_type", "")), str(props.get("osm_id", "")))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    category = f"{props.get('osm_key', 'place')}:{props.get('osm_value', 'place')}"
+                    places.append({"name": str(props["name"]), "lat": lat, "lon": lon,
+                                   "category": category, "detail": ", ".join(part for part in
+                                       (props.get("street"), props.get("city")) if part)})
                 _poi_cache[cache_key] = (time.monotonic(), places)
                 if len(_poi_cache) > 80:
                     for key in list(_poi_cache)[:40]:
                         _poi_cache.pop(key, None)
                 self.respond(200, {"places": places})
             except Exception as exc:
-                self.respond(502, {"error": f"Nearby place labels are unavailable: {exc}"})
+                self.respond(502, {"error": f"Nearby places are temporarily unavailable: {exc}"})
             return
         if route == "/api/devices":
             try:
