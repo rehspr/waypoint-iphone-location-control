@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 import re
 import subprocess
@@ -34,9 +35,53 @@ _last_worker_error = ""
 _command_version = 0
 _geocode_lock = threading.Lock()
 _last_geocode = 0.0
-_ip_location_cache: tuple[float, dict[str, object]] | None = None
 _poi_cache: dict[str, tuple[float, list[dict[str, object]]]] = {}
 _last_poi_request = 0.0
+GOOGLE_GEOLOCATION_KEY = "WAYPOINT_GOOGLE_GEOLOCATION_API_KEY"
+
+
+def geolocation_api_key() -> str:
+    key = os.environ.get(GOOGLE_GEOLOCATION_KEY, "").strip()
+    if key:
+        return key
+    try:
+        for line in (ROOT / ".env").read_text(encoding="utf-8").splitlines():
+            name, separator, value = line.partition("=")
+            if separator and name.strip() == GOOGLE_GEOLOCATION_KEY:
+                return value.strip().strip("\"'")
+    except OSError:
+        pass
+    return ""
+
+
+def parse_wifi_access_points(output: str) -> list[dict[str, str | int]]:
+    access_points: dict[str, dict[str, str | int]] = {}
+    current: dict[str, str | int] | None = None
+    for line in output.splitlines():
+        match = re.search(r"\bBSSID\s+\d+\s*:\s*([0-9a-fA-F:-]{17})", line)
+        if match:
+            if current:
+                access_points[str(current["macAddress"])] = current
+            raw_mac = re.sub(r"[:-]", "", match.group(1)).upper()
+            first_octet = int(raw_mac[:2], 16) if len(raw_mac) == 12 else 0
+            is_universal_unicast = not (first_octet & 0x03)
+            if len(raw_mac) == 12 and raw_mac != "000000000000" and is_universal_unicast and not raw_mac.startswith("00005E"):
+                mac = ":".join(raw_mac[index:index + 2] for index in range(0, 12, 2))
+                current = {"macAddress": mac, "signalStrength": -85}
+            else:
+                current = None
+            continue
+        if not current:
+            continue
+        signal = re.search(r"\bSignal\s*:\s*(\d{1,3})%", line, re.IGNORECASE)
+        if signal:
+            current["signalStrength"] = max(-100, min(-1, int(int(signal.group(1)) / 2 - 100)))
+        channel = re.search(r"\bChannel\s*:\s*(\d{1,3})", line, re.IGNORECASE)
+        if channel:
+            current["channel"] = int(channel.group(1))
+    if current:
+        access_points[str(current["macAddress"])] = current
+    return sorted(access_points.values(), key=lambda point: int(point["signalStrength"]), reverse=True)[:20]
 
 
 def cli(*args: str, timeout: int = 45) -> subprocess.CompletedProcess[str]:
@@ -457,12 +502,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         route = parsed.path
+        if route == "/api/capabilities":
+            self.respond(200, {"wifi_lookup": True, "wifi_key_configured": bool(geolocation_api_key()), "ip_location": False})
+            return
         if route == "/api/geocode":
             params = parse_qs(parsed.query)
             query = params.get("q", [""])[0].strip()
             try:
                 near_lat = float(params["near_lat"][0]) if "near_lat" in params else None
                 near_lon = float(params["near_lon"][0]) if "near_lon" in params else None
+                if (near_lat is None) != (near_lon is None):
+                    raise ValueError
                 if near_lat is not None and (not -90 <= near_lat <= 90 or not -180 <= near_lon <= 180):
                     raise ValueError
             except (ValueError, IndexError):
@@ -477,53 +527,83 @@ class Handler(BaseHTTPRequestHandler):
                     delay = 1.0 - (time.monotonic() - _last_geocode)
                     if delay > 0:
                         time.sleep(delay)
-                    search_url = "https://nominatim.openstreetmap.org/search?format=jsonv2&limit=10&addressdetails=1&q=" + quote(query)
+                    search_params = {"q": query, "limit": "10", "lang": "en"}
                     if near_lat is not None:
-                        # Nominatim's viewbox biases results toward this area without excluding farther matches.
-                        search_url += f"&viewbox={near_lon - 0.35:.5f},{near_lat + 0.25:.5f},{near_lon + 0.35:.5f},{near_lat - 0.25:.5f}"
+                        # Photon applies a proximity ranking around these caller-supplied map coordinates.
+                        search_params.update({"lat": f"{near_lat:.3f}", "lon": f"{near_lon:.3f}"})
+                    search_url = "https://photon.komoot.io/api/?" + urlencode(search_params)
                     request = Request(
                         search_url,
-                        headers={"User-Agent": "WaypointPC/0.2 (local desktop location planner)"},
+                        headers={"User-Agent": "WaypointPC/0.6 (local desktop location planner)", "Accept": "application/json"},
                     )
                     with urlopen(request, timeout=12) as response:
-                        results = json.loads(response.read().decode("utf-8"))
+                        features = json.loads(response.read().decode("utf-8")).get("features", [])
                     _last_geocode = time.monotonic()
                 normalized = []
-                for item in results:
-                    lat, lon = float(item["lat"]), float(item["lon"])
-                    distance = None
+                for feature in features:
+                    coordinates = feature.get("geometry", {}).get("coordinates", [])
+                    if len(coordinates) != 2:
+                        continue
+                    lon, lat = map(float, coordinates)
+                    properties = feature.get("properties", {})
+                    name = properties.get("name") or properties.get("street") or properties.get("city") or "Place"
+                    street = " ".join(str(value) for value in (properties.get("housenumber"), properties.get("street")) if value)
+                    detail = ", ".join(dict.fromkeys(str(value) for value in (
+                        name, street, properties.get("city"), properties.get("state"), properties.get("country")
+                    ) if value))
+                    distance = 0
                     if near_lat is not None:
                         dy = (lat - near_lat) * 111_320
                         dx = (lon - near_lon) * 111_320 * math.cos(math.radians(near_lat))
-                        distance = round(math.hypot(dx, dy))
-                    normalized.append({"name": item.get("name") or item.get("display_name", "Place"),
-                                       "detail": item.get("display_name", "Place"), "lat": lat, "lon": lon,
-                                       "distance_m": distance})
+                        distance = math.hypot(dx, dy)
+                    normalized.append({"name": name, "detail": detail or name, "lat": lat, "lon": lon,
+                                       "_distance": distance})
                 if near_lat is not None:
-                    normalized.sort(key=lambda item: item["distance_m"])
+                    normalized.sort(key=lambda item: item["_distance"])
+                for item in normalized:
+                    item.pop("_distance", None)
                 self.respond(200, {"results": normalized})
             except Exception as exc:
                 self.respond(502, {"error": f"Place search failed: {exc}"})
             return
-        if route == "/api/ip-location":
-            global _ip_location_cache
-            cached = _ip_location_cache
-            if cached and time.monotonic() - cached[0] < 1800:
-                self.respond(200, cached[1])
+        if route == "/api/wifi-location":
+            api_key = geolocation_api_key()
+            if not api_key:
+                self.respond(503, {"error": f"Wi-Fi lookup is off until {GOOGLE_GEOLOCATION_KEY} is set in waypoint-pc/.env. No Wi-Fi scan or data was sent."})
                 return
             try:
-                request = Request("https://ipapi.co/json/", headers={"User-Agent": "WaypointPC/0.5 (local desktop map)", "Accept": "application/json"})
-                with urlopen(request, timeout=8) as response:
-                    item = json.loads(response.read().decode("utf-8"))
-                lat, lon = float(item["latitude"]), float(item["longitude"])
-                if not -90 <= lat <= 90 or not -180 <= lon <= 180 or item.get("error"):
-                    raise ValueError("The IP location provider returned no usable location.")
-                result = {"lat": lat, "lon": lon,
-                          "label": ", ".join(part for part in (item.get("city"), item.get("region_code") or item.get("region"), item.get("country_code")) if part)}
-                _ip_location_cache = (time.monotonic(), result)
-                self.respond(200, result)
-            except Exception as exc:
-                self.respond(502, {"error": f"Could not estimate this network's location: {exc}"})
+                scan = subprocess.run(
+                    ["netsh", "wlan", "show", "networks", "mode=bssid"],
+                    capture_output=True, text=True, timeout=12,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if scan.returncode:
+                    scan_error = f"{scan.stdout}\n{scan.stderr}".casefold()
+                    if "location permission" in scan_error or "location access" in scan_error:
+                        self.respond(403, {"error": "Windows blocks Wi-Fi scans while system location access is off. Waypoint left that setting unchanged; use the map center or pick a start point."})
+                    else:
+                        self.respond(502, {"error": "Windows could not scan nearby Wi-Fi access points. No access point data was sent."})
+                    return
+                access_points = parse_wifi_access_points(scan.stdout)
+                if len(access_points) < 2:
+                    self.respond(422, {"error": "Windows found fewer than two Wi-Fi access points. Google needs at least two nearby access points for a Wi-Fi estimate."})
+                    return
+                body = json.dumps({"considerIp": False, "wifiAccessPoints": access_points}).encode("utf-8")
+                request = Request(
+                    "https://www.googleapis.com/geolocation/v1/geolocate?" + urlencode({"key": api_key}),
+                    data=body,
+                    headers={"Content-Type": "application/json", "Accept": "application/json"},
+                )
+                with urlopen(request, timeout=15) as response:
+                    result = json.loads(response.read().decode("utf-8"))
+                location = result["location"]
+                lat, lon, accuracy = float(location["lat"]), float(location["lng"]), float(result["accuracy"])
+                if not (-90 <= lat <= 90 and -180 <= lon <= 180 and accuracy >= 0):
+                    raise ValueError("Google returned an invalid location estimate.")
+                self.respond(200, {"lat": lat, "lon": lon, "accuracy": accuracy,
+                                   "access_points": len(access_points), "source": "wifi"})
+            except Exception:
+                self.respond(502, {"error": "Google could not estimate this Wi-Fi network. Check API activation, billing, and the API key. IP fallback is disabled."})
             return
         if route == "/api/pois":
             global _last_poi_request
